@@ -1,0 +1,92 @@
+#include "cuda_check.cuh"
+#include <vector>
+
+__global__ void matmul(const float *a, const float *b, float *c, int m, int k, int n)
+{
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int q = 0; q < k; ++q) {
+            sum += a[row * k + q] * b[q * n + col];
+        }
+        c[row * n + col] = sum;
+    }
+}
+
+int main()
+{
+    const int n_size = 512,  m = n_size, k = n_size, n = n_size;
+    std::vector<float> a(m * k), b(k * n), c(m * n);
+    
+    for (int i = 0; i < m * k; ++i) a[i] = ((i % 17) - 8) * 0.125f;
+    for (int i = 0; i < k * n; ++i) b[i] = ((i % 13) - 6) * 0.0625f;
+    
+    std::size_t a_bytes = a.size() * sizeof(float);
+    std::size_t b_bytes = b.size() * sizeof(float);
+    std::size_t c_bytes = c.size() * sizeof(float);
+    
+    float *d_a = nullptr, *d_b = nullptr, *d_c = nullptr;
+    
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_a), a_bytes));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_b), b_bytes));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_c), c_bytes));
+    
+    CUDA_CHECK(cudaMemcpy(d_a, a.data(), a_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b, b.data(), b_bytes, cudaMemcpyHostToDevice));
+    
+    dim3 block(16, 16);
+    dim3 grid((n + block.x - 1) / block.x,
+              (m + block.y - 1) / block.y);
+              
+    matmul<<<grid, block>>>(d_a, d_b, d_c, m, k, n);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    CUDA_CHECK(cudaEventRecord(start));
+    
+    matmul<<<grid, block>>>(d_a, d_b, d_c, m, k, n);
+    
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float kernel_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, start, stop));
+
+    CUDA_CHECK(cudaMemcpy(c.data(), d_c, c_bytes, cudaMemcpyDeviceToHost));
+
+    double tk_sec = static_cast<double>(kernel_ms) / 1000.0;
+    double flops = 2.0 * static_cast<double>(m) * static_cast<double>(k) * static_cast<double>(n);
+    double gflops = flops / (tk_sec * 1e9);
+
+    int errors = 0;
+    double max_error = 0.0;
+    for (int row = 0; row < m; ++row) {
+        for (int col = 0; col < n; ++col) {
+            double reference = 0.0;
+            for (int q = 0; q < k; ++q) {
+                reference += static_cast<double>(a[row * k + q]) * b[q * n + col];
+            }
+            double got = c[row * n + col];
+            double error = std::fabs(got - reference);
+            if (error > max_error) max_error = error;
+            if (!close_enough(got, reference, 1e-4, 1e-4)) ++errors;
+        }
+    }
+
+    std::printf("Matrix: %dx%dx%d | Tk = %.6f ms | Performa = %.2f GFLOP/s | errors = %d\n",
+                m, k, n, kernel_ms, gflops, errors);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaFree(d_a));
+    CUDA_CHECK(cudaFree(d_b));
+    CUDA_CHECK(cudaFree(d_c));
+
+    return errors != 0;
+}
